@@ -1,0 +1,296 @@
+Synchronizing FTP Files with Perl
+February 28th, 2003 by Luis E. Muñoz in
+
+    * Software
+
+The author explains ftpsync, his script that automatically uploads changed files and directories from a local site.
+Average:
+Cancel rating
+Poor
+Okay
+Good
+Great
+Awesome
+Your rating: None
+
+Originally, this article was stored on a minimalistic web site. I, along with the thousands of users who use that site, use FTP to maintain the content. This used to mean that after making changes to one or more of the pages on the site, I had to go to my FTP client and upload the changed files.
+
+Here is where Perl's laziness took over. I wanted a script that could automatically figure out what needed to be uploaded from my local copy of the site, as well as what needed to be deleted. I called this script ftpsync, and I present it here. As customary, you can download the complete script.
+Beginning the Script
+
+At the start, I summon strict warnings to help me catch errors in my code. You should always do the same in your scripts, as errors and warnings end up saving a lot of debugging time should you, say, misspell a variable name somewhere in your 5,000 lines of code. Don't panic, this script is much shorter.
+
+Net::FTP is invoked in order to provide the FTP client with the functionality this script requires. Mainly, the client needs to traverse a hierarchy of files and directories in the FTP server. To do the same in my local disk, File::Find is used. File::Find makes writing code that traverses a filesystem a snap. I will discuss how a bit later.
+
+In order to easily produce the script's documentation for futures users, Pod::Usage is invoked. This module converts and displays the POD documentation from the script. You should always write POD documentation for your scripts. I then import Getopt::Std to parse the command-line options.
+
+                1   #!/usr/bin/perl
+                2
+                3   # This script is (c) 2002 Luis E. Muñoz, All Rights Reserved
+                4   # This code can be used under the same terms as Perl itself.
+                5   # with absolutely NO WARRANTY. Use at your own risk.
+                6
+                7   use strict;
+                8   use warnings;
+                9   use Net::FTP;
+               10   use File::Find;
+               11   use Pod::Usage;
+               12   use Getopt::Std;
+
+At line 14, I tell Perl about the variables where the command-line options are going to be stored by Getopt::Std. This module actually has two ways of returning the command-line information: a hash and a bunch of separate variables named after the options they represent. I tend to prefer the later method, because it makes it easier to spot the places where the variables are being used. But this is mostly a matter of personal taste.
+
+               14   use vars qw($opt_s $opt_k $opt_u $opt_l $opt_p $opt_r $opt_h
+               15               $opt_d $opt_P $opt_i $opt_o);
+               16
+               17   getopts('i:o:l:s:u:p:r:hkvdP');
+
+The call to getopts() at line 17 actually tells Getopt::Std about which options to look for and whether those options require an argument. Following an option letter with a colon character (:) tells the module to take one argument for the corresponding option.
+
+Had I wanted to leave the result of parsing the command-line options in a hash instead of a lot of $opt_ vars, I could have used the following code:
+
+               14   use vars qw(%my_opts);
+               15
+               16   getopts('i:o:l:s:u:p:r:hkvdP', \%my_opts);
+
+Usage Messages and Default Values
+
+In my scripts, I reserve the -h option to provide some form of help, as is the custom of many other Perl programmers. The if block on lines 19 through 23 arranges for a call to pod2usage with the proper arguments when the -h option is specified in the command line.
+
+               19   if ($opt_h)
+               20   {
+               21       pod2usage({-exitval => 2,
+               22                  -verbose => 2});
+               23   }
+
+pod2usage is defined by Pod::Usage, and as shown on line 21, it causes the script to terminate after dumping the complete documentation and returns a value of 2 to the operating system. You also can have the script dump only its SYNOPSIS section, which includes custom messages along with documentation and a variety of other things. Please consult the documentation of Pod::usage for complete information.
+
+               25   $opt_s ||= 'localhost';
+               26   $opt_u ||= 'anonymous';
+               27   $opt_p ||= 'someuser@';
+               28   $opt_r ||= '/';
+               29   $opt_l ||= '.';
+               30   $opt_o ||= 0;
+               31
+               32   $opt_i = qr/$opt_i/ if $opt_i;
+
+Lines 25 through 30 define some sensible default values for the command-line options not specified by the user. I do so neatly with the ||= operator. This operator evaluates its left-hand side or lvalue. A false value causes its right-hand value or rvalue to be assigned to the lvalue. It works like this: if the command-line option is not specified, its corresponding $opt_ variable will be undef, which evaluates to false. It is thus set to whatever is on the right hand of the ||= operator. If the command line option is specified, the $opt_ will evaluate to true, and its value left unchanged.
+
+At line 32, I ask Perl to compile whatever is the argument to -i that is stored in $opt_i as a regular expression or rule, as they are beginning to be called. This is done with the qr// operator. You can learn more about this operator by looking at the documentation for perlop.
+A Brief Discussion of the How
+
+In order to execute the synchronization, the script collects information from two filesystem trees, one local and one remote. I chose to collect all the information from both trees and perform the synchronization later. In my experience, this translates to cleaner and more maintainable code than if I tried to do everything in one pass. I'll store the data about the remote and local trees in two hashes, which I declare and initialize at lines 36 and 37.
+
+               36   my %rem = ();
+               37   my %loc = ();
+
+Once the information is safely captured in the corresponding hashes, the code can focus on the differences and take the appropriate actions.
+Finding Out about the Local Files
+
+When matching the contents of the remote FTP site with those on the local copy, it is important to compare apples to apples. Because the filesystem layout is not always straightforward, I chose to compare relative pathnames. Therefore, before looking for the local files, I do a chdir() to the path the user specified with the -l option, as seen on line 44.
+
+               44   chdir $opt_l or die "Cannot change dir to $opt_l:   $!\n";
+
+After this step, I use find(), as provided by File::Find, to traverse the local tree. Below is the code from line 46 to 69. I will explain this code bit by bit, I promise.
+
+               46   find(
+               47        {
+               48            no_chdir       => 1,
+               49            follow         => 0,   # No symlinks, please
+               50            wanted         => sub
+               51            {
+               52                return if $File::Find::name eq '.';
+               53                $File::Find::name =~ s!^\./!!;
+               54                if ($opt_i and $File::Find::name =~ m/$opt_i/)
+               55                {
+               56                    print "local: IGNORING $File::Find::name\n"
+               57                    return;
+               58                }
+               59                my $r = $loc{$File::Find::name} =
+               60                {
+               61                    mdtm => (stat($File::Find::name))[9],
+               62                    size => (stat(_))[7],
+               63                    type => -f _ ? 'f' : -d _ ? 'd'
+               64                        : -l $File::Find::name ? 'l' : '?',
+               65                };
+               66                print "local: adding $File::Find::name (",
+               67                "$r->{mdtm}, $r->{size}, $r->{type})\n" if $opt
+               68            },
+               69        }, '.' );
+
+At line 48, I tell find() that I don't want the script to chdir() into each directory along the way using the no_chdir argument. I want to be absolutely sure that I am seeing path names that are consistent and relative to whatever the user specified with the -l option.
+
+At line 49, I prevent following symbolic links with the follow argument. I do not want to deal with them mainly because of the infinite loops they can introduce when pointing upwards in the filesystem. I do not use symlinks in my web site, so I see no problem with this.
+
+At line 50, finally, there's some interesting code. find() accepts a user-supplied function that will be called for each filesystem object found. I specify it using the wanted argument, although there are various ways to invoke this function. Please see perldoc File::Find for more information.
+
+The wanted argument requires a reference to a sub, which I define in lines 50 through 68. Line 52 makes sure that I do not include the current directory (.) in the collection. find() passes the complete path name of each filesystem object in the $File::Find::name scalar.
+
+The find() function, when used as shown, produces relative path names, such as ./dir/foo.htm. However, I consider it easier to work with names such as dir/foo.htm. Both are legal forms of relative paths. To accomplish this, line 53 removes the leading ./ from all the pathnames.
+
+After this is done, a check is performed on lines 54 through 58 to see if the current pathname matches the ignored regular expression specified with -i. This is a matter of a simple pattern match that exits the sub { .. } if a match is detected, after providing an informational message when the -v option is specified.
+
+By line 59 all tests have passed, so we should collect the information from this file. I'll collect three elements of information: the modification time or mdtm, the file size and the file type. The first two are collected with the stat() call, which returns a list of values. Notice that I use the special stat(_) construct in line 62.
+
+It turns out that stat() is a somewhat expensive operation, so it is better to do as few of them as possible. When Perl sees bare _ as an argument to a function or operator that would cause a call to stat(), it uses the results of the last one performed. Therefore, the above construct causes only a single stat() call, even when Perl's stat() function is used more than once. The same applies to the -x file operators that I use in lines 63 and 64 to assign a type to this file.
+
+All of this information, kept in a reference to an anonymous hash, is stored in %loc. Additionally, a copy of the last entry is kept in the $r lexical scalar to provide the informational message in lines 66 and 67, if the -v option was specified. So, when find() calls this sub for each object found in the filesystem, %loc will be populated with the data for the whole tree.
+Connecting to the FTP Site
+
+I chose to connect to the FTP site after collecting the local file information for various reasons. The first and most important is that, as a rule of thumb, whenever you write network-client code, keep your impact on the server to a minimum. In this way, I spare the connection of the time it takes to collect the local information.
+
+               74   my $ftp = new Net::FTP ($opt_s,
+               75                           Debug           => $opt_d,
+               76                           Passive         => $opt_P,
+               77                           );
+               78
+               79   die "Failed to connect to server '$opt_s': $!\n" unless $ftp
+               80   die "Failed to login as $opt_u\n" unless $ftp->login($opt_u,
+               81   die "Cannot change directory to $opt_r\n" unless $ftp->cwd($
+               82   warn "Failed to set binary mode\n" unless $ftp->binary();
+               83
+               84   print "connected\n" if $opt_v;
+
+Lines 74 through 77 handle the connection to the server, which in case of failure trigger the error message from line 79. At line 80, authentication with the credentials passed in the command line is attempted, again producing a fatal error in case of failure. A number of parameters for the FTP connection can be controlled by passing arguments to the new() method. The definitive information is in the module's documentation.
+
+At line 81 we change the remote directory to whatever the user supplied. Finally, at line 82, we request binary mode for any subsequent transfers. Line 84 prints a progress message if the -v option is supplied in the command line.
+Finding Out about Remote Files
+
+Collecting the same data from the remote files through FTP is a more difficult task, because there's no equivalent to the stat() call through FTP. Therefore, I resort to parsing the result of a directory listing. I chose to support a UNIX-style directory listing, as it is quite and also because it is what my FTP server uses.
+
+Basically, the code from line 86 through line 132 emulates the work done by File::Find, which was shown previously with a recursive function, scan_ftp. This function takes a Net::FTP object, a pathname to work with and a reference to %rem to register the relevant information. I'll comment on each chunk of the code below.
+
+               86   sub scan_ftp
+               87   {
+               88       my $ftp     = shift;
+               89       my $path    = shift;
+               90       my $rrem    = shift;
+               91
+               92       my $rdir = $ftp->dir($path);
+               93
+               94       return unless $rdir and @$rdir;
+               95
+               96       for my $f (@$rdir)
+               97       {
+               98           next if $f =~ m/^d.+\s\.\.?$/;
+               99
+              100           my $n = (split(/\s+/, $f, 9))[8];
+              101           next unless defined $n;
+              102
+              103           my $name = '';
+              104           $name = $path . '/' if $path;
+              105           $name .= $n;
+              106
+              107           if ($opt_i and $name =~ m/$opt_i/)
+              108           {
+              109               print "ftp: IGNORING $name\n" if $opt_d;
+              110               next;
+              111           }
+              112
+              113           next if exists $rrem->{$name};
+              114
+              115           my $mdtm = ($ftp->mdtm($name) || 0) + $opt_o;
+              116           my $size = $ftp->size($name) || 0;
+              117           my $type = substr($f, 0, 1);
+              118
+              119           $type =~ s/-/f/;
+              120
+              121           warn "ftp: adding $name ($mdtm, $size, $type)\n" if 
+              122
+              123           $rrem->{$name} =
+              124           {
+              125               mdtm => $mdtm,
+              126               size => $size,
+              127               type => $type,
+              128           };
+              129
+              130           scan_ftp($ftp, $name, $rrem) if $type eq 'd';
+              131       }
+              132   }
+              133
+              134   scan_ftp($ftp, '', \%rem);
+
+At line 92 I request a directory listing of the assigned $path, which is stored as a reference to a list in $rdir. Each entry in @$rdir contains one line of output from the FTP server. With line 94, we abandon early in case we get an empty or invalid answer.
+
+Between lines 96 and 132 is the loop where each line of the command output is analyzed. The test at line 98 makes sure no time is wasted in analyzing the current (.) and parent (..) directories. Later, in line 100, an attempt is made to obtain the file name, typically at the ninth column of output. If no name can be found, the entry is skipped in line 101. As you can see, the split at line 100 limits the number of columns returned. I did this in case someday I need to parse symlinks too, which are reported by many servers as Foo -> Bar.
+
+In lines 103 through 105, I construct the complete pathname using the $path passed to this function along with the recently parsed directory entry. The if block starting at line 107 checks for an entry that should be ignored. If so, lines 109 and 110 print a suitable message and then skip to the next entry.
+
+Line 113 checks if we already have seen this entry. This might happen if the remote FTP tree has a loop I couldn't detect. I use the exists construct as a costume to avoid autovivifying an entry in the %rem hash, although in this case it could have been removed.
+
+Lines 115 to 117 are responsible for capturing the relevant information for each item found in this phase. We use the MDTM FTP command to obtain the modification time, the SIZE command to find the size of the file in octets and, finally, the first letter of the directory listing to guess the type. The MDTM method of Net::FTP automatically translates the resulting date to the number of seconds since the Epoch UTC, the same as other time-related functions, such as time() and stat() return.
+
+Here, however, I allow for the -o argument, a time offset, to be added to the result. This allows easy correction of time skew. It also has proven useful to compensate for time-zone differences, because sometimes the time returned by the FTP server is not in UTC.
+
+I probably should do an MDTM only on files and not on directories or any other kind of object. But I chose to leave it as is because I want to check with various FTP servers, to see if they return a meaningful timestamp for directories and other objects. In any case, this code could be rewritten to avoid the useless MDTM seen below.
+
+              115           my $type = substr($f, 0, 1);
+              116           my $mdtm = ($type eq 'f' ? $ftp->mdtm($name) || 0 : 
+              117           my $size = $ftp->size($name) || 0;
+
+Lines 123 through 128 store the information gathered about this entry. In line 130, the recursive call is made if the current entry is a directory. At line 134, I start the recursion.
+The Synchronization
+
+Once all the data has been nicely collected in %loc and %rem, all that is left is to deal with the differences. The simple synchronization I use uploads only the local files that are missing or are too old on the remote side, and then remote files that are not present locally are deleted. The code below takes care of the uploading.
+
+              138   for my $l (sort { length($a) <=> length($b) } keys %loc)
+              139   {
+              140       warn "Symbolic link $l not supported\n"
+              141           if $loc{$l}->{type} eq 'l';
+              142
+              143       if ($loc{$l}->{type} eq 'd')
+              144       {
+              145           next if exists $rem{$l};
+              146           print "$l dir missing in the FTP repository\n" if $o
+              147           $opt_k ? print "MKDIR $l\n" : $ftp->mkdir($l)
+              148               or die "Failed to MKDIR $l\n";
+              149       }
+              150       else
+              151       {
+              152           next if exists $rem{$l} and $rem{$l}->{mdtm} >= $loc
+              153           print "$l file missing or older in the FTP repositor
+              154               if $opt_v;
+              155           $opt_k ? print "PUT $l $l\n" : $ftp->put($l, $l)
+              156               or die "Failed to PUT $l\n";
+              157       }
+              158   }
+
+The loop at line 138 iterates through all the local files that must be matched. I do this from the shortest pathname to the longest, so we can create any required directories in order. Lines 140 and 141 produce an adequate warning and skip any symbolic links that might have been found.
+
+The code from line 143 through line 157 is worth some explanation. The script expects to see two different classes of filesystem objects, files and directories. In the case of a directory, handled in lines 143 to 149, any remote object with the same name causes the entry to be skipped. Otherwise, a proper message is produced in lines 146 and 147, and if needed, the remote directory is created. In case of failure, the script simply die()s at line 148 to avoid causing more trouble.
+
+If the local object is not a directory, the skip condition also states that the remote object is older. This check is done in line 151. Then, similar code is executed from lines 152 to 157, using the put() method of Net::FTP to upload the missing file. The entire process is repeated for every local object.
+
+Other sets of tests are possible, but I chose to leave them out. For instance, a local file could have the same name that a remote directory has. In this case, it is not clear to me what to do: remove the remote directory and upload the local file?; die()? I'll leave that decision as an exercise for the reader.
+
+Next, the remote files are analyzed. In this case, the only possible action is to delete the remote files if their local counterpart is not present. The loop beginning in line 162 ensures that the files are scanned in the exact reverse order of the loop for the previous code snippet. This allows the DELE FTP command, issued by the delete() method of the Net::FTP module, to remove all files and empty directories automatically.
+
+              162   for my $r (sort { length($b) <=> length($a) } keys %rem)
+              163   {
+              164       if ($rem{$r}->{type} eq 'l')
+              165       {
+              166           warn "Symbolic link $r not supported\n";
+              167           next;
+              168       }
+              169
+              170       next if exists $loc{$r};
+              171
+              172       print "$r file missing locally\n" if $opt_v;
+              173       $opt_k ? print "DELETE $r\n" : $ftp->delete($r)
+              174           or die "Failed to DELETE $r\n";
+              175   }
+
+As with local files, lines 164 through 168 issue an adequate message for symlinks and skip them. Line 170 skips any remote file whose local counterpart is in %loc. In lines 172 through 174, a message is printed, and the FTP command to delete the file is either echoed as an informational message or carried out. If an error is detected, the script die()s preventively.
+Conclusions
+
+This script does not try to be a complete synchronization solution, and certain cases are not handled at all. However, this tool has served my needs well. Now, I can hack away in my local copy of my web pages, and later simply run a command such as:
+
+            bash-2.05a$ ./perl/ftpsync -s my.ftp -u lem -p 37337 \
+               -l /my/local/site -i 'CVS|(^\.)|/\.|(~$)' -v -o 14400
+            connected
+            perl/index-en.htm file missing or older in the FTP repository
+            create_this dir missing in the FTP repository
+            Untitled.gif file missing locally
+
+and have an updated web site a couple of minutes later, without having to remember which files I touched. The regexp I feed to -i should prevent any CVS control files, which begins with a dot, and any Emacs backups from being touched at all. I also specify an offset of 14,400 seconds (4 hours) to compensate for the fact that this FTP server is running in my local time zone instead of in UTC, as it should be.
+
+email: luismunoz@cpan.org
